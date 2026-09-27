@@ -33,7 +33,8 @@ import re
 import urllib.error
 import urllib.request
 
-MODEL = os.environ.get("VOLOK_AI_MODEL", "claude-haiku-4-5-20251001")
+# Пустая переменная Actions — это пустая СТРОКА, а не отсутствие.
+MODEL = (os.environ.get("VOLOK_AI_MODEL") or "").strip() or "claude-haiku-4-5-20251001"
 KEY = (os.environ.get("VOLOK_AI_KEY") or "").strip()
 API = "https://api.anthropic.com/v1/messages"
 IMPACTS = ("plus", "minus", "risk", "neutral")
