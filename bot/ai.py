@@ -76,8 +76,14 @@ TIMEOUT = int(_env("VOLOK_AI_TIMEOUT", "60"))
 # Запасная намеренно ДРУГОГО СЕМЕЙСТВА: если у семейства окажется общая
 # беда (формат ответа, недоступность площадки для этой модели), запасная
 # её не повторит.
-MODEL = _env("VOLOK_AI_MODEL", "deepseek-ai/DeepSeek-V4-Pro")
-MODEL2 = _env("VOLOK_AI_MODEL2", "openai/gpt-oss-120b")
+# Пара выбрана ФАКТОМ 27.09.2026: из девяти сильнейших моделей каталога
+# Cloud.ru платными на этом счёте отвечают РОВНО ДВЕ — claude-opus-4.8 и
+# claude-sonnet-4.6; остальные, включая самые дешёвые, отдают 402 «не
+# хватает средств». Обе одного семейства, и это вынужденно: другого
+# оплаченного семейства нет. Когда счёт пополнят, запасную надо перевести
+# в другое семейство — переменной VOLOK_AI_MODEL2, без правки кода.
+MODEL = _env("VOLOK_AI_MODEL", "anthropic/claude-opus-4.8")
+MODEL2 = _env("VOLOK_AI_MODEL2", "anthropic/claude-sonnet-4.6")
 BASE2 = _env("VOLOK_AI_BASE2", BASE)
 
 IMPACTS = ("plus", "minus", "risk", "neutral")

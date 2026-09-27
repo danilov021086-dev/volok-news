@@ -77,7 +77,11 @@ AI_MAX_PER_RUN = _env_int("VOLOK_AI_MAX", 25)
 # «примерно такая же»: выдуманный рубль в отчёте не лучше выдуманного
 # числа на экране.
 PRICE_RUB_PER_M = {
-    # Cloud.ru Evolution Foundation Models
+    # Cloud.ru Evolution Foundation Models.
+    # Числа сверены с каталогом площадки фактом 27.09.2026: она отдаёт их
+    # в metadata каждой модели (prompt_tokens_cost / generated_tokens_cost).
+    "anthropic/claude-opus-4.8": (854.0, 4270.0),
+    "anthropic/claude-sonnet-4.6": (589.26, 2946.3),
     "deepseek-ai/DeepSeek-V4-Flash": (18.53, 37.08),
     "deepseek-ai/DeepSeek-V4.1-Flash": (64.94, 194.81),
     "deepseek-ai/DeepSeek-V4-Pro": (183.0, 732.0),
@@ -271,7 +275,12 @@ def main():
         used["выход"] += vout
         if a:
             used["разобрано"] += 1
-    used["руб"] = round(price_rub(used["вход"], used["выход"]), 4)
+    # Цена может быть неизвестна: модель новая, в таблице её нет. Это не
+    # повод падать — пишем null, и в ленте честно видно, что расход не
+    # посчитан. Прежняя редакция звала round() от None и роняла весь бот
+    # при первой же смене модели.
+    _руб = price_rub(used["вход"], used["выход"])
+    used["руб"] = round(_руб, 4) if _руб is not None else None
     if len(new_items) > AI_MAX_PER_RUN:
         print("разбор отложен для %d новостей (предохранитель)"
               % (len(new_items) - AI_MAX_PER_RUN))

@@ -171,6 +171,54 @@ def _get_text(url, timeout=TIMEOUT):
         return r.read().decode("utf-8").strip()
 
 
+def retarget():
+    """Прогноз пересчёта сложности от mempool.space.
+
+    ЗАЧЕМ. В эталоне у плитки «Пересчёт сложности» подпись «прогноз
+    +1,8%», а у «До халвинга» — «апрель 2028». Считать такой прогноз из
+    сложности и цены нельзя — это была бы выдумка. Но mempool.space
+    публикует его сам, тем же API, откуда мы уже берём сложность и
+    высоту: difficultyChange (в процентах) и дата следующего пересчёта.
+    Значит подпись эталона можно оставить дословно и заполнить настоящим
+    числом.
+
+    Сбой не роняет ленту: возвращаем пустой словарь, и подпись честно
+    останется без числа."""
+    try:
+        d = _get("https://mempool.space/api/v1/difficulty-adjustment")
+    except Exception:                                           # noqa: BLE001
+        return {}
+    out = {}
+    try:
+        out["прогноз_проц"] = round(float(d["difficultyChange"]), 2)
+    except Exception:                                           # noqa: BLE001
+        pass
+    try:
+        # Дата приходит в миллисекундах.
+        out["дата_пересчёта_unix"] = int(d["estimatedRetargetDate"]) // 1000
+    except Exception:                                           # noqa: BLE001
+        pass
+    for наше, их in (("осталось_блоков", "remainingBlocks"),
+                     ("средний_блок_сек", "timeAvg")):
+        try:
+            out[наше] = int(d[их]) // (1000 if наше.endswith("сек") else 1)
+        except Exception:                                        # noqa: BLE001
+            pass
+    return out
+
+
+МЕСЯЦЫ = ("январь", "февраль", "март", "апрель", "май", "июнь", "июль",
+          "август", "сентябрь", "октябрь", "ноябрь", "декабрь")
+
+
+def месяц_года(суток_вперёд):
+    """«апрель 2028» из числа суток. Подпись эталона, честное число."""
+    if суток_вперёд is None:
+        return None
+    t = time.localtime(time.time() + float(суток_вперёд) * 86400)
+    return "%s %d" % (МЕСЯЦЫ[t.tm_mon - 1], t.tm_year)
+
+
 def network():
     """Сложность и хешрейт сети. Два источника: второй — страховка."""
     try:
@@ -220,6 +268,7 @@ def build(prev=None):
                                   ("сложность", diff)) if not v]
         hp_note = "не хватает: " + ", ".join(missing)
 
+    rt = retarget()
     out = {
         "btc_usdt": {
             "текущая": _field(btc_now, btc_src.get("24h") or "Bybit",
@@ -254,6 +303,12 @@ def build(prev=None):
             # До халвинга: то же, но до конца окна в 210 000 блоков.
             "до_халвинга_блоков": (HALVING_EVERY - (h % HALVING_EVERY)) if h else None,
             "до_халвинга_суток": round((HALVING_EVERY - (h % HALVING_EVERY)) / BLOCKS_PER_DAY) if h else None,
+            # Подписи из эталона: «прогноз +1,8%» и «апрель 2028».
+            # Первое — от mempool.space, второе считается из суток.
+            "прогноз_пересчёта_проц": rt.get("прогноз_проц"),
+            "халвинг_месяц": месяц_года(
+                round((HALVING_EVERY - (h % HALVING_EVERY)) / BLOCKS_PER_DAY)
+                if h else None),
         },
         "хешпрайс_руб_за_th_в_сутки": _field(
             hashprice, "расчёт из сложности, цены BTC и курса доллара",
