@@ -241,3 +241,203 @@ def _try_one(title, source, date_ru, модель, база):
     ai["разобрано_unix"] = int(time.time())
     ai["секунд"] = took
     return ai, usage, None
+
+
+# =====================================================================
+# ПАЧКОЙ ДО ДЕСЯТИ ЗАГОЛОВКОВ В ОДНОМ ЗАПРОСЕ (пункт 1.3 задания)
+# =====================================================================
+# ЗАЧЕМ. Раньше каждый заголовок стоил отдельного запроса, и в каждом
+# заново уезжала инструкция на ~370 токенов. При сорока новостях в сутки
+# это сорок инструкций — то есть мы платили за одно и то же сорок раз.
+# Пачкой из десяти инструкция уходит ОДИН раз на десять заголовков.
+#
+# ЧЕГО ЗДЕСЬ НЕТ И БЫТЬ НЕ ДОЛЖНО. Пачка не «добирает» ответы: если
+# модель вернула оценку не на все заголовки, остальные остаются с
+# ai: null и попадут в следующий прогон. Подставить соседнюю оценку или
+# шаблон — значит соврать про новость, которую модель не смотрела.
+#
+# ПОЧЕМУ НОМЕРА, А НЕ ЗАГОЛОВКИ В ОТВЕТЕ. Возвращать заголовок целиком
+# дорого (это выходные токены) и ненадёжно: модель перепишет кавычки или
+# сократит, и сопоставить будет нечем. Номер сопоставляется точно.
+BATCH_MAX = int(_env("VOLOK_AI_BATCH", "10"))
+
+SYSTEM_BATCH = (
+    "Ты помогаешь владельцу майнинг-фермы на биткоине быстро понять, "
+    "касается ли его новость. Тебе дают СПИСОК заголовков с номерами. "
+    "Оцени влияние каждого именно на ДОХОД ФЕРМЫ: цену биткоина, "
+    "сложность сети, хешпрайс, цену оборудования, электричество, законы "
+    "для майнеров в России.\n"
+    "Отвечай СТРОГО одним JSON-объектом, без пояснений, без рассуждений "
+    "и без разметки:\n"
+    "{\"items\":[{\"n\":1,\"impact\":\"plus|minus|risk|neutral\","
+    "\"text\":\"одна фраза до 140 знаков\"}]}\n"
+    "В items — по одной записи на КАЖДЫЙ номер из списка, номер n тот же, "
+    "что во входе.\n"
+    "impact: plus — доход фермы скорее вырастет; minus — скорее упадёт; "
+    "risk — прямого влияния нет, но есть угроза (проверки, запреты, "
+    "возможная коррекция курса); neutral — на доход фермы не влияет.\n"
+    "Запреты: не придумывай содержание статьи сверх заголовка; "
+    "если по заголовку непонятно — neutral; "
+    "никаких советов покупать или продавать; "
+    "text не длиннее 140 знаков."
+)
+
+
+def ask_raw_batch(записи, model=None, base=None, key=None, timeout=None,
+                  maxtok_each=None):
+    """Один запрос на пачку. записи — список (n, заголовок, источник, дата).
+
+    Потолок ответа считается от числа заголовков: 80 токенов на каждый
+    (столько же, сколько задание отводит одной новости) плюс небольшой
+    запас на обёртку JSON."""
+    model = model or MODEL
+    base = (base or BASE).rstrip("/")
+    key = key or KEY
+    timeout = timeout or TIMEOUT
+    each = int(maxtok_each or _env("VOLOK_AI_MAXTOK_NEWS", "80"))
+    список = "\n".join(
+        "%d. Источник: %s | Дата: %s | Заголовок: %s" % (n, s, d, t)
+        for n, t, s, d in записи)
+    body = json.dumps({
+        "model": model,
+        "max_tokens": each * len(записи) + 64,
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": SYSTEM_BATCH},
+            {"role": "user", "content": список},
+        ],
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(base + "/chat/completions", data=body, headers={
+        "content-type": "application/json",
+        "authorization": "Bearer " + key,
+    })
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8"))
+    took = round(time.time() - t0, 2)
+    ch = (d.get("choices") or [{}])[0]
+    txt = ((ch.get("message") or {}).get("content") or "").strip()
+    return txt, (d.get("usage") or {}), took
+
+
+def _obj_po_skobkam(raw):
+    """Самый длинный разобравшийся объект в ответе.
+
+    Нежадное {…} здесь не годится: у ответа вида {"items":[{…}]} оно
+    вернёт первую вложенную запись, где ключа items нет. Ровно на этом
+    стенд сравнения моделей 27.09 забраковал пять верных прогнозов из
+    пяти — ошибка была в проверке, а не в модели."""
+    луч = None
+    for i, ch in enumerate(raw):
+        if ch != "{":
+            continue
+        глуб = 0
+        for j in range(i, len(raw)):
+            if raw[j] == "{":
+                глуб += 1
+            elif raw[j] == "}":
+                глуб -= 1
+                if глуб == 0:
+                    try:
+                        o = json.loads(raw[i:j + 1])
+                    except Exception:                           # noqa: BLE001
+                        break
+                    if isinstance(o, dict) and (луч is None
+                                                or j + 1 - i > луч[1]):
+                        луч = (o, j + 1 - i)
+                    break
+    return луч[0] if луч else None
+
+
+def parse_batch(raw, номера):
+    """Разобрать ответ на пачку. Возвращает (словарь n -> ai, причины).
+
+    Проверки — ТЕ ЖЕ, что у одиночного разбора: они живут в parse(), и
+    вызываются здесь для каждой записи. Двух разных проверок быть не
+    должно, иначе пачка пропустит то, что одиночный разбор отбивает."""
+    if not raw:
+        return {}, ["пустой ответ модели"]
+    o = _obj_po_skobkam(raw)
+    if not isinstance(o, dict) or not isinstance(o.get("items"), list):
+        return {}, ["в ответе нет объекта с items"]
+    вышло, причины = {}, []
+    видел = set()
+    for it in o["items"]:
+        if not isinstance(it, dict):
+            continue
+        try:
+            n = int(it.get("n"))
+        except (TypeError, ValueError):
+            причины.append("запись без номера n")
+            continue
+        if n not in номера:
+            причины.append("номер %d, которого не было в запросе" % n)
+            continue
+        if n in видел:
+            причины.append("номер %d пришёл дважды" % n)
+            continue
+        видел.add(n)
+        ai, why = parse(json.dumps({"impact": it.get("impact"),
+                                    "text": it.get("text")},
+                                   ensure_ascii=False))
+        if ai is None:
+            причины.append("номер %d: %s" % (n, why))
+            continue
+        вышло[n] = ai
+    пропущены = sorted(set(номера) - видел)
+    if пропущены:
+        причины.append("модель не ответила про номера: %s"
+                       % ", ".join(str(x) for x in пропущены))
+    return вышло, причины
+
+
+def analyse_batch(записи, log):
+    """Разобрать пачку. записи — список (ключ, заголовок, источник, дата).
+
+    Возвращает (словарь ключ -> ai, usage). Ключей, про которые модель не
+    ответила, в словаре НЕТ — вызывающий оставит им ai: null, и следующий
+    прогон попробует снова. Переключение на запасную — как у одиночного
+    разбора: пачку целиком отдаём второй модели."""
+    if not KEY:
+        log.append({"причина": "ключ не задан", "пачка": len(записи)})
+        return {}, {}
+    if not записи:
+        return {}, {}
+    ном = {i + 1: z[0] for i, z in enumerate(записи)}
+    вход = [(i + 1, z[1], z[2], z[3]) for i, z in enumerate(записи)]
+    usage_total = {}
+    for роль, модель, база in (("основная", MODEL, BASE),
+                               ("запасная", MODEL2, BASE2)):
+        try:
+            raw, usage, took = ask_raw_batch(вход, model=модель, base=база)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:120]
+            except Exception:                                   # noqa: BLE001
+                pass
+            log.append({"кто": роль, "модель": модель, "пачка": len(записи),
+                        "причина": "HTTP %s: %s" % (e.code, detail)})
+            continue
+        except Exception as e:                                   # noqa: BLE001
+            log.append({"кто": роль, "модель": модель, "пачка": len(записи),
+                        "причина": "сеть: %s" % str(e)[:120]})
+            continue
+        if usage:
+            usage_total = usage
+        вышло, причины = parse_batch(raw, set(ном))
+        for p in причины:
+            log.append({"кто": роль, "модель": модель, "причина": p})
+        if вышло:
+            итог = {}
+            for n, ai in вышло.items():
+                ai["кто"] = роль
+                ai["модель"] = модель
+                ai["площадка"] = база
+                ai["разобрано_unix"] = int(time.time())
+                ai["секунд"] = took
+                ai["пачкой"] = len(записи)
+                итог[ном[n]] = ai
+            return итог, usage_total
+        # Ни одной годной оценки — пробуем запасную той же пачкой.
+    return {}, usage_total
