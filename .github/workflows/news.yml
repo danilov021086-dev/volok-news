@@ -1,0 +1,74 @@
+name: Лента новостей ВОЛОК
+
+# Каждые 30 минут. Точное время GitHub не обещает: при нагрузке запуск
+# сдвигается на несколько минут. Для получасовой ленты это неважно, а
+# кабинет всё равно смотрит на «обновлено_unix» и сам скажет, если лента
+# отстала больше чем на три часа.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:          # кнопка «запустить сейчас» в интерфейсе
+
+# Боту нужно право записи в репозиторий: он коммитит news.json.
+permissions:
+  contents: write
+
+concurrency:
+  # Два прогона одновременно подрались бы за один и тот же news.json.
+  group: news
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Сторонних библиотек нет намеренно: бот написан на стандартной
+      # библиотеке. Меньше зависимостей — меньше поводов однажды
+      # сломаться из-за чужого выпуска.
+      - name: Собрать ленту
+        env:
+          VOLOK_AI_KEY: ${{ secrets.VOLOK_AI_KEY }}
+          VOLOK_AI_MODEL: ${{ vars.VOLOK_AI_MODEL }}
+          VOLOK_AI_MAX: ${{ vars.VOLOK_AI_MAX }}
+        run: python bot/fetch_news.py
+
+      - name: Показать, что вышло
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open('news.json', encoding='utf-8'))
+          print('обновлено:', d['обновлено_мск'])
+          print('новостей:', d['новостей'])
+          a = d['разбор_ии']
+          print('разбор ИИ:', 'включён' if a['включён'] else 'ВЫКЛЮЧЕН (нет ключа)',
+                '| разобрано за прогон:', a['разобрано_за_прогон'])
+          if a['отказы']:
+              print('отказов разбора:', len(a['отказы']), '| первая причина:',
+                    a['отказы'][0].get('причина'))
+          m = d.get('market') or {}
+          hp = (m.get('хешпрайс_руб_за_th_в_сутки') or {}).get('значение')
+          print('хешпрайс, руб/TH в сутки:', hp)
+          if d.get('ошибки'):
+              print('ОШИБКИ ИСТОЧНИКОВ:', d['ошибки'])
+          PY
+
+      - name: Сохранить news.json
+        run: |
+          git config user.name "volok-news"
+          git config user.email "volok-news@users.noreply.github.com"
+          git add news.json
+          # Коммит только если файл правда изменился: иначе история
+          # обрастёт пустыми записями по два раза в час.
+          if git diff --cached --quiet; then
+            echo "ничего не изменилось — коммита нет"
+          else
+            git commit -m "лента: $(python -c "import json;print(json.load(open('news.json',encoding='utf-8'))['обновлено_мск'])")"
+            git push
+          fi
