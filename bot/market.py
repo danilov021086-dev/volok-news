@@ -145,6 +145,32 @@ def rub_series():
     return out, errs
 
 
+# Высота блока нужна для двух чисел на сайте: сколько осталось до
+# пересчёта сложности и сколько до халвинга. Оба считаются ПО ВЫСОТЕ, а
+# не по календарю: сеть идёт своим темпом, и «через 5 дней» из макета —
+# это снимок одного дня, а не постоянная величина.
+BLOCKS_PER_DAY = 144.0          # 10 минут на блок — проектный темп сети
+RETARGET = 2016                 # блоков между пересчётами сложности
+HALVING_EVERY = 210000          # блоков между халвингами
+
+
+def height():
+    """Высота последнего блока. Два источника, как у сложности."""
+    try:
+        return int(_get_text("https://mempool.space/api/blocks/tip/height")), "mempool.space"
+    except Exception:                                           # noqa: BLE001
+        try:
+            return int(_get_text("https://blockchain.info/q/getblockcount")), "blockchain.info"
+        except Exception:                                       # noqa: BLE001
+            return None, None
+
+
+def _get_text(url, timeout=TIMEOUT):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8").strip()
+
+
 def network():
     """Сложность и хешрейт сети. Два источника: второй — страховка."""
     try:
@@ -178,6 +204,7 @@ def build(prev=None):
     btc, btc_err, btc_src = btc_series()
     rub, rub_err = rub_series()
     diff, nethash, netsrc, neterr = network()
+    h, hsrc = height()
 
     # Текущая цена — последняя точка суточного ряда.
     btc_now = btc["24h"][-1][1] if btc.get("24h") else None
@@ -214,6 +241,19 @@ def build(prev=None):
             "хешрейт_hs": _field(nethash, netsrc or "—", nethash is not None, neterr,
                                  prev_ok(("сеть", "хешрейт_hs"))),
             "награда_btc": REWARD_BTC,
+        },
+        "блок": {
+            "высота": _field(h, hsrc or "—", h is not None,
+                             "оба источника молчат" if h is None else None,
+                             prev_ok(("блок", "высота"))),
+            # До пересчёта сложности: сколько блоков осталось до конца
+            # текущего окна в 2016 блоков, и сколько это суток при
+            # проектных 144 блоках в сутки.
+            "до_пересчёта_блоков": (RETARGET - (h % RETARGET)) if h else None,
+            "до_пересчёта_суток": round((RETARGET - (h % RETARGET)) / BLOCKS_PER_DAY, 1) if h else None,
+            # До халвинга: то же, но до конца окна в 210 000 блоков.
+            "до_халвинга_блоков": (HALVING_EVERY - (h % HALVING_EVERY)) if h else None,
+            "до_халвинга_суток": round((HALVING_EVERY - (h % HALVING_EVERY)) / BLOCKS_PER_DAY) if h else None,
         },
         "хешпрайс_руб_за_th_в_сутки": _field(
             hashprice, "расчёт из сложности, цены BTC и курса доллара",
