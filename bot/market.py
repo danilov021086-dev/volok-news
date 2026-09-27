@@ -73,24 +73,56 @@ def _field(value, source, ok, err=None, prev_unix=None):
     return out
 
 
+def _bybit(interval, limit):
+    u = ("https://api.bybit.com/v5/market/kline?category=spot"
+         "&symbol=BTCUSDT&interval=%s&limit=%d" % (interval, limit))
+    rows = (_get(u).get("result") or {}).get("list") or []
+    if not rows:
+        raise ValueError("Bybit вернул пустой список")
+    # Bybit отдаёт от новых к старым — разворачиваем, чтобы график рисовался
+    # слева направо, как читают люди.
+    return [[int(r[0]) // 1000, float(r[4])] for r in rows][::-1]
+
+
+def _coingecko_btc(days, tail=None):
+    u = ("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+         "?vs_currency=usd&days=%d" % days)
+    pts = [[int(p[0]) // 1000, float(p[1])] for p in (_get(u).get("prices") or [])]
+    if not pts:
+        raise ValueError("CoinGecko вернул пустой ряд")
+    return pts[-tail:] if tail else pts
+
+
 def btc_series():
-    """Ряды BTC/USDT за час, сутки и 30 дней. Свеча — [unix, цена]."""
-    out, errs = {}, {}
-    plan = (("1h", "1", 60), ("24h", "15", 96), ("30d", "D", 30))
-    for name, interval, limit in plan:
+    """Ряды BTC/USDT за час, сутки и 30 дней. Свеча — [unix, цена].
+
+    ДВА ИСТОЧНИКА, И ЭТО НЕ ПЕРЕСТРАХОВКА. Первый прогон на GitHub
+    показал: Bybit отдаёт бегунку Actions **403 Forbidden** — биржи
+    закрываются от дата-центров. С домашней машины тот же запрос
+    проходит, поэтому в разработке это не видно вовсе.
+
+    Порядок такой: сперва Bybit (тот же источник, что у приложения —
+    значит числа на сайте и в телефоне сходятся), при отказе —
+    CoinGecko. В ответе честно написано, КТО дал число: если однажды
+    сайт и приложение разойдутся на десяток долларов, причина будет
+    видна сразу, а не после часа поисков."""
+    out, errs, src = {}, {}, {}
+    plan = (("1h", "1", 60, 1, 60), ("24h", "15", 96, 1, None),
+            ("30d", "D", 30, 30, None))
+    for name, interval, limit, cg_days, cg_tail in plan:
         try:
-            u = ("https://api.bybit.com/v5/market/kline?category=spot"
-                 "&symbol=BTCUSDT&interval=%s&limit=%d" % (interval, limit))
-            d = _get(u)
-            rows = (d.get("result") or {}).get("list") or []
-            # Bybit отдаёт от новых к старым — разворачиваем, чтобы график
-            # рисовался слева направо, как читают люди.
-            pts = [[int(r[0]) // 1000, float(r[4])] for r in rows][::-1]
-            out[name] = thin(pts)
-        except Exception as e:                                  # noqa: BLE001
-            out[name] = None
-            errs[name] = str(e)
-    return out, errs
+            out[name] = thin(_bybit(interval, limit))
+            src[name] = "Bybit"
+        except Exception as e1:                                 # noqa: BLE001
+            try:
+                out[name] = thin(_coingecko_btc(cg_days, cg_tail))
+                src[name] = "CoinGecko"
+                errs[name] = "Bybit: %s — взято у CoinGecko" % e1
+            except Exception as e2:                             # noqa: BLE001
+                out[name] = None
+                src[name] = None
+                errs[name] = "Bybit: %s; CoinGecko: %s" % (e1, e2)
+    return out, errs, src
 
 
 def rub_series():
@@ -143,7 +175,7 @@ def build(prev=None):
         except Exception:                                       # noqa: BLE001
             return None
 
-    btc, btc_err = btc_series()
+    btc, btc_err, btc_src = btc_series()
     rub, rub_err = rub_series()
     diff, nethash, netsrc, neterr = network()
 
@@ -163,8 +195,10 @@ def build(prev=None):
 
     return {
         "btc_usdt": {
-            "текущая": _field(btc_now, "Bybit", btc_now is not None,
-                              btc_err.get("24h"), prev_ok(("btc_usdt", "текущая"))),
+            "текущая": _field(btc_now, btc_src.get("24h") or "Bybit",
+                              btc_now is not None, btc_err.get("24h"),
+                              prev_ok(("btc_usdt", "текущая"))),
+            "источники_рядов": btc_src,
             "ряды": {"1ч": btc.get("1h"), "24ч": btc.get("24h"), "30д": btc.get("30d")},
             "ошибки": btc_err or None,
         },
