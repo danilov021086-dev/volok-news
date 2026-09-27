@@ -70,6 +70,43 @@ def _env_int(name, default):
 
 AI_MAX_PER_RUN = _env_int("VOLOK_AI_MAX", 25)
 
+# ЦЕНА ТОКЕНОВ, рублей за МИЛЛИОН (вход, выход). Снято с официальных
+# страниц 27.09.2026. Нужна ровно для одного: посчитать настоящий расход
+# за прогон и показать владельцу цену за месяц по ФАКТУ, а не по оценке.
+# Модели нет в таблице — цена не считается (пишем null), а не берётся
+# «примерно такая же»: выдуманный рубль в отчёте не лучше выдуманного
+# числа на экране.
+PRICE_RUB_PER_M = {
+    # Cloud.ru Evolution Foundation Models
+    "deepseek-ai/DeepSeek-V4-Flash": (18.53, 37.08),
+    "deepseek-ai/DeepSeek-V4.1-Flash": (64.94, 194.81),
+    "deepseek-ai/DeepSeek-V4-Pro": (183.0, 732.0),
+    "deepseek/deepseek-chat-v3-0324": (37.32, 170.89),
+    "Qwen/Qwen3.6-35B-A3B": (219.6, 329.4),
+    "Qwen/Qwen3-30B-A3B": (13.91, 55.61),
+    "Qwen/Qwen3-32B": (37.08, 148.29),
+    "openai/gpt-oss-120b": (15.86, 61.0),
+    "openai/gpt-oss-20b": (5.89, 27.50),
+    "z-ai/glm-4.6": (102.48, 375.76),
+    # Yandex AI Studio: в прайсе цена за 1000 токенов, здесь приведена
+    # к миллиону (0,3 ₽ за 1000 = 300 ₽ за миллион).
+    "deepseek-v4-flash": (300.0, 500.0),
+    "qwen3.6-35b-a3b": (200.0, 300.0),
+    "gpt-oss-120b": (300.0, 300.0),
+    "gpt-oss-20b": (100.0, 100.0),
+}
+
+
+def price_rub(tin, tout, model=None):
+    """Рублей за указанные токены. Модель неизвестна — None."""
+    m = model or ai_mod.MODEL
+    # У Яндекса модель приходит как gpt://<каталог>/<имя> — берём имя.
+    short = m.rsplit("/", 1)[-1] if m.startswith("gpt://") else m
+    p = PRICE_RUB_PER_M.get(m) or PRICE_RUB_PER_M.get(short)
+    if not p:
+        return None
+    return tin / 1e6 * p[0] + tout / 1e6 * p[1]
+
 
 # ----------------------------------------------------------------- время
 def parse_date(s):
@@ -221,15 +258,20 @@ def main():
     print("новых новостей: %d" % len(new_items))
 
     # ---------------- разбор ИИ только для новых
-    used = {"вход": 0, "выход": 0, "разобрано": 0}
+    used = {"вход": 0, "выход": 0, "разобрано": 0, "руб": 0.0}
     for rec in new_items[:AI_MAX_PER_RUN]:
         a, usage = ai_mod.analyse(rec["заголовок"], rec["источник"],
                                   rec["дата_мск"], ailog)
         rec["ai"] = a
+        # Токены считаем и у отказов тоже: заплачено за них одинаково.
+        # Имена полей у OpenAI-совместимых площадок общие.
+        vin = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        vout = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        used["вход"] += vin
+        used["выход"] += vout
         if a:
             used["разобрано"] += 1
-            used["вход"] += int(usage.get("input_tokens") or 0)
-            used["выход"] += int(usage.get("output_tokens") or 0)
+    used["руб"] = round(price_rub(used["вход"], used["выход"]), 4)
     if len(new_items) > AI_MAX_PER_RUN:
         print("разбор отложен для %d новостей (предохранитель)"
               % (len(new_items) - AI_MAX_PER_RUN))
@@ -252,10 +294,15 @@ def main():
         "новостей": len(items),
         "разбор_ии": {
             "включён": bool(ai_mod.KEY),
+            "площадка": ai_mod.BASE if ai_mod.KEY else None,
             "модель": ai_mod.MODEL if ai_mod.KEY else None,
             "разобрано_за_прогон": used["разобрано"],
+            "отказов_за_прогон": len(ailog),
             "токенов_вход": used["вход"],
             "токенов_выход": used["выход"],
+            # Расход считается ЗДЕСЬ, а не на глаз: по нему владелец
+            # увидит настоящую цену за месяц, а не мою оценку.
+            "цена_за_прогон_руб": used["руб"],
             "отказы": ailog[:40],
         },
         "ошибки": errors or None,
