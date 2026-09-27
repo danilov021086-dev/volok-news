@@ -67,8 +67,18 @@ def _env(name, default=""):
 
 BASE = _env("VOLOK_AI_BASE", "https://foundation-models.api.cloud.ru/v1")
 KEY = _env("VOLOK_AI_KEY")
-MODEL = _env("VOLOK_AI_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 TIMEOUT = int(_env("VOLOK_AI_TIMEOUT", "60"))
+
+# ОСНОВНАЯ И ЗАПАСНАЯ — та же пара, что у сайта (задание v31, часть Б2).
+# Одна пара на весь проект: иначе лента и консультант однажды начнут
+# отвечать по-разному, и объяснить это будет нечем.
+#
+# Запасная намеренно ДРУГОГО СЕМЕЙСТВА: если у семейства окажется общая
+# беда (формат ответа, недоступность площадки для этой модели), запасная
+# её не повторит.
+MODEL = _env("VOLOK_AI_MODEL", "deepseek-ai/DeepSeek-V4-Pro")
+MODEL2 = _env("VOLOK_AI_MODEL2", "openai/gpt-oss-120b")
+BASE2 = _env("VOLOK_AI_BASE2", BASE)
 
 IMPACTS = ("plus", "minus", "risk", "neutral")
 MAXLEN = 140
@@ -178,34 +188,50 @@ def parse(raw):
 
 
 def analyse(title, source, date_ru, log):
-    """Вернуть (ai, usage). ai — словарь или None. Причина отказа — в log."""
+    """Вернуть (ai, usage). ai — словарь или None. Причина отказа — в log.
+
+    ПЕРЕКЛЮЧЕНИЕ НА ЗАПАСНУЮ. Основная не ответила, ответила негодным
+    или упала — пробуем запасную. Обе молчат — ai: null и причина в
+    журнал. Шаблон не подставляем никогда: выдуманная оценка под видом
+    разбора хуже, чем честное отсутствие разбора."""
     if not KEY:
         log.append({"заголовок": title[:80], "причина": "ключ не задан"})
         return None, {}
+    usage_total = {}
+    for роль, модель, база in (("основная", MODEL, BASE),
+                               ("запасная", MODEL2, BASE2)):
+        ai, usage, why = _try_one(title, source, date_ru, модель, база)
+        if usage:
+            usage_total = usage
+        if ai is not None:
+            ai["кто"] = роль
+            return ai, usage_total
+        log.append({"заголовок": title[:80], "кто": роль, "модель": модель,
+                    "причина": why})
+    return None, usage_total
+
+
+def _try_one(title, source, date_ru, модель, база):
+    """Одна попытка одной моделью. Возвращает (ai, usage, причина отказа)."""
     try:
-        raw, usage, took = ask_raw(title, source, date_ru)
+        raw, usage, took = ask_raw(title, source, date_ru, model=модель, base=база)
     except urllib.error.HTTPError as e:
         detail = ""
         try:
-            detail = e.read().decode("utf-8", "replace")[:160]
+            detail = e.read().decode("utf-8", "replace")[:120]
         except Exception:                                       # noqa: BLE001
             pass
-        log.append({"заголовок": title[:80],
-                    "причина": "HTTP %s от площадки" % e.code,
-                    "ответ": detail})
-        return None, {}
+        return None, {}, "HTTP %s: %s" % (e.code, detail)
     except Exception as e:                                      # noqa: BLE001
-        log.append({"заголовок": title[:80], "причина": "сеть: %s" % e})
-        return None, {}
+        return None, {}, "сеть: %s" % str(e)[:120]
 
     ai, why = parse(raw)
     if ai is None:
-        log.append({"заголовок": title[:80], "причина": why, "ответ": raw[:140]})
-        return None, usage
+        return None, usage, why
     # У каждой оценки — кто её дал и когда. Через месяц это единственный
     # способ понять, почему две соседние новости оценены по-разному.
-    ai["модель"] = MODEL
-    ai["площадка"] = BASE
+    ai["модель"] = модель
+    ai["площадка"] = база
     ai["разобрано_unix"] = int(time.time())
     ai["секунд"] = took
-    return ai, usage
+    return ai, usage, None
