@@ -112,6 +112,71 @@ SOVET = ("купит", "продав", "продат", "закупа", "инве
          "вкладывай", "шортит", "лонг")
 
 
+
+# =====================================================================
+# ВЫКЛЮЧЕНИЕ РАССУЖДЕНИЙ (замер 28.09.2026)
+# =====================================================================
+# ЗАМЕР, ИЗ-ЗА КОТОРОГО ЭТО ПОЯВИЛОСЬ. Первый живой прогон на варианте Б
+# разобрал пачку из пяти заголовков и показал 1588 выходных токенов — при
+# потолке 80 на заголовок, то есть 464 на всю пачку. Больше потолка.
+# Объяснение одно: модель РАССУЖДАЛА, а рассуждения площадка считает
+# выходными токенами и оплачивает, но потолком ответа не ограничивает.
+#
+# То есть «думающие режимы выключены» в задании до сих пор выполнялось
+# лишь в том смысле, что мы их не включали. Открытые модели рассуждают по
+# умолчанию, и выключать надо явно.
+#
+# ЧТО ПОДОШЛО (проверено на площадке тем же ключом):
+#   thinking {"type":"disabled"}   — работает у DeepSeek V4 Flash и GLM-5.2
+#   enable_thinking=false          — принимается, но рассуждения остаются
+#   reasoning_effort=none          — HTTP 400, допустимы только low..max
+#
+# ПОЧЕМУ С ОТКАТОМ. Поле понимают не все модели, а список «кто понимает»
+# в коде устареет. Шлём; площадка ответила 400 и жалуется на это поле —
+# запоминаем модель и повторяем без него.
+NOTHINK = {"type": "disabled"}
+_nothink_bad = set()
+
+
+def _телом_без_рассуждений(тело, модель):
+    """Добавить в тело запроса выключение рассуждений, если можно."""
+    if _env("VOLOK_AI_THINK", "") in ("1", "да", "yes"):
+        return тело                      # нарочно оставили рассуждения
+    if модель in _nothink_bad:
+        return тело
+    тело = dict(тело)
+    тело["thinking"] = NOTHINK
+    return тело
+
+
+def _post_json(base, key, тело, timeout, модель):
+    """Запрос с откатом, если площадка не поняла выключение рассуждений."""
+    for попытка in (1, 2):
+        req = urllib.request.Request(
+            base.rstrip("/") + "/chat/completions",
+            data=json.dumps(тело, ensure_ascii=False).encode("utf-8"),
+            headers={"content-type": "application/json",
+                     "authorization": "Bearer " + key})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if попытка == 1 and e.code == 400 and "thinking" in тело:
+                кусок = ""
+                try:
+                    кусок = e.read().decode("utf-8", "replace")[:300].lower()
+                except Exception:                               # noqa: BLE001
+                    pass
+                if "thinking" in кусок or "reasoning" in кусок:
+                    _nothink_bad.add(модель)
+                    print("модель %s не приняла выключение рассуждений — "
+                          "дальше шлём без него" % модель)
+                    тело = dict(тело)
+                    тело.pop("thinking", None)
+                    continue
+            raise
+    raise RuntimeError("запрос не удался")
+
 def ask_raw(title, source, date_ru, model=None, base=None, key=None,
             timeout=None):
     """Один запрос к модели. Возвращает (текст ответа, usage, сек).
@@ -123,23 +188,18 @@ def ask_raw(title, source, date_ru, model=None, base=None, key=None,
     base = (base or BASE).rstrip("/")
     key = key or KEY
     timeout = timeout or TIMEOUT
-    body = json.dumps({
+    тело = _телом_без_рассуждений({
         "model": model,
         "max_tokens": 300,
-        "temperature": 0,          # оценка должна быть воспроизводимой
+        "temperature": 0,
         "messages": [
             {"role": "system", "content": SYSTEM},
             {"role": "user", "content":
              "Источник: %s\nДата: %s\nЗаголовок: %s" % (source, date_ru, title)},
         ],
-    }, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(base + "/chat/completions", data=body, headers={
-        "content-type": "application/json",
-        "authorization": "Bearer " + key,
-    })
+    }, model)
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.loads(r.read().decode("utf-8"))
+    d = _post_json(base, key, тело, timeout, model)
     took = round(time.time() - t0, 2)
     ch = (d.get("choices") or [{}])[0]
     msg = ch.get("message") or {}
@@ -298,7 +358,7 @@ def ask_raw_batch(записи, model=None, base=None, key=None, timeout=None,
     список = "\n".join(
         "%d. Источник: %s | Дата: %s | Заголовок: %s" % (n, s, d, t)
         for n, t, s, d in записи)
-    body = json.dumps({
+    тело = _телом_без_рассуждений({
         "model": model,
         "max_tokens": each * len(записи) + 64,
         "temperature": 0,
@@ -306,14 +366,9 @@ def ask_raw_batch(записи, model=None, base=None, key=None, timeout=None,
             {"role": "system", "content": SYSTEM_BATCH},
             {"role": "user", "content": список},
         ],
-    }, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(base + "/chat/completions", data=body, headers={
-        "content-type": "application/json",
-        "authorization": "Bearer " + key,
-    })
+    }, model)
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        d = json.loads(r.read().decode("utf-8"))
+    d = _post_json(base, key, тело, timeout, model)
     took = round(time.time() - t0, 2)
     ch = (d.get("choices") or [{}])[0]
     txt = ((ch.get("message") or {}).get("content") or "").strip()
