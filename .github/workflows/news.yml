@@ -43,7 +43,18 @@ jobs:
           # DeepSeek V4 Flash).
           VOLOK_AI_BASE: ${{ vars.VOLOK_AI_BASE }}
           VOLOK_AI_MODEL: ${{ vars.VOLOK_AI_MODEL }}
+          # ЗАПАСНАЯ МОДЕЛЬ. Её переменной здесь не было вовсе — то есть
+          # bot/ai.py брал запасную из умолчания в коде, и смена пары через
+          # настройки Actions меняла только основную. Поймано при включении
+          # варианта Б: основная уехала на DeepSeek V4 Flash, а запасной
+          # осталась бы Claude Sonnet 4.6 — то есть при первом же отказе
+          # лента молча вернулась бы к дорогой модели.
+          VOLOK_AI_MODEL2: ${{ vars.VOLOK_AI_MODEL2 }}
           VOLOK_AI_MAX: ${{ vars.VOLOK_AI_MAX }}
+          # Суточный предел расхода ленты. Без этой строки бот берёт
+          # умолчание 5 ₽ из кода, но держать предел в настройках нужно:
+          # менять его, не выпуская новую версию бота.
+          VOLOK_AI_BUDGET_DAY: ${{ vars.VOLOK_AI_BUDGET_DAY }}
         run: python bot/fetch_news.py
 
       - name: Показать, что вышло
