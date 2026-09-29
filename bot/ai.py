@@ -304,6 +304,144 @@ def _try_one(title, source, date_ru, модель, база):
 
 
 # =====================================================================
+# «КОРОТКО» — СВОЙ ПЕРЕСКАЗ СТАТЬИ (задание /novosti/, часть 2)
+# =====================================================================
+# Новое решение владельца 29.09.2026: для публичной страницы новостей бот
+# ЧИТАЕТ текст статьи по ссылке и пишет «Коротко» — 2–3 предложения СВОИМИ
+# словами. Это отступает от прежней записи «текст статьи бот не берёт»:
+# прежняя касалась ленты кабинета (оценка по заголовку), новая — публичной
+# страницы. Полный текст статьи НИКОГДА не публикуется и не хранится —
+# только свой пересказ (часть 2.2).
+#
+# ТРИ ЗАЩИТЫ:
+#   1. Проверка на копирование: ни одной цепочки в 8+ слов подряд из
+#      оригинала (сравнение по словам). Не прошло — переписать один раз,
+#      снова не прошло — «Коротко» нет.
+#   2. Статья не открылась — «Коротко» нет (С1), новость всё равно
+#      публикуется с заголовком и оценкой.
+#   3. Расход в общем пределе бота (5 ₽/сутки, жёсткий потолок).
+KOROTKO_ON = _env("VOLOK_KOROTKO", "1") not in ("0", "", "off", "нет")
+KOROTKO_MAXTOK = int(_env("VOLOK_KOROTKO_MAXTOK", "150"))
+ARTICLE_MAXCHARS = int(_env("VOLOK_ARTICLE_CHARS", "2400"))
+
+SYSTEM_KOROTKO = (
+    "Ты пишешь короткий пересказ новости для владельца майнинг-фермы. "
+    "Тебе дают текст статьи. Перескажи суть 2–3 предложениями СВОИМИ "
+    "словами, простым русским. Строгие правила: не копируй фразы из "
+    "оригинала (перефразируй), не советуй покупать или продавать, не "
+    "предсказывай цену числами, не выдумывай фактов и статей законов, не "
+    "добавляй ничего от себя сверх статьи. Только пересказ, без вступлений "
+    "и заголовков."
+)
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+_SCRIPT_RE = re.compile(r"<(script|style)\b.*?</\1>", re.S | re.I)
+
+
+def fetch_article(url, timeout=None):
+    """Достать текст статьи по ссылке. Возвращает строку или ''.
+
+    Грубо: снимаем скрипты/стили и теги, берём длинные текстовые куски.
+    Точный парсинг не нужен — модель пересказывает суть, а не структуру."""
+    timeout = timeout or TIMEOUT
+    try:
+        req = urllib.request.Request(url, headers={
+            "user-agent": "Mozilla/5.0 (compatible; VolokNewsBot/1.0)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read(600000).decode("utf-8", "replace")
+    except Exception:                                           # noqa: BLE001
+        return ""
+    # вырезаем <article> если есть — там основной текст; иначе весь body
+    m = re.search(r"<article\b[^>]*>(.*?)</article>", raw, re.S | re.I)
+    body = m.group(1) if m else raw
+    body = _SCRIPT_RE.sub(" ", body)
+    # абзацы
+    paras = re.findall(r"<p\b[^>]*>(.*?)</p>", body, re.S | re.I)
+    text = " ".join(_TAG_RE.sub(" ", p) for p in paras) if paras \
+        else _TAG_RE.sub(" ", body)
+    import html as _h
+    text = _h.unescape(text)
+    text = _WS_RE.sub(" ", text).strip()
+    return text[:ARTICLE_MAXCHARS]
+
+
+def _words(s):
+    return re.findall(r"\w+", (s or "").lower(), re.U)
+
+
+def copied(peresk, original, n=8):
+    """True, если в пересказе есть цепочка n+ слов подряд из оригинала."""
+    pw, ow = _words(peresk), _words(original)
+    if len(pw) < n:
+        return False
+    oset = set()
+    for i in range(len(ow) - n + 1):
+        oset.add(tuple(ow[i:i + n]))
+    for i in range(len(pw) - n + 1):
+        if tuple(pw[i:i + n]) in oset:
+            return True
+    return False
+
+
+def _korotko_once(article, модель, база):
+    """Один запрос пересказа. Возвращает (текст, usage, причина)."""
+    тело = _телом_без_рассуждений({
+        "model": модель,
+        "max_tokens": KOROTKO_MAXTOK,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": SYSTEM_KOROTKO},
+            {"role": "user", "content": "Текст статьи:\n" + article},
+        ],
+    }, модель)
+    try:
+        d = _post_json(база, KEY, тело, TIMEOUT, модель)
+    except urllib.error.HTTPError as e:
+        return "", {}, "HTTP %s" % e.code
+    except Exception as e:                                       # noqa: BLE001
+        return "", {}, "сеть: %s" % str(e)[:80]
+    ch = (d.get("choices") or [{}])[0]
+    txt = ((ch.get("message") or {}).get("content") or "").strip()
+    return txt, (d.get("usage") or {}), None
+
+
+def korotko(title, url, log):
+    """«Коротко» своими словами. Возвращает (текст|None, usage).
+
+    Нет ключа / выключено / статья не открылась / не прошло проверку на
+    копирование дважды — None (С1: блок «Коротко» просто не покажется)."""
+    if not KOROTKO_ON or not KEY:
+        return None, {}
+    article = fetch_article(url)
+    if len(_words(article)) < 40:
+        log.append({"заголовок": title[:80], "коротко": "статья не открылась"})
+        return None, {}
+    usage_total = {}
+    for роль, модель, база in (("основная", MODEL, BASE),
+                               ("запасная", MODEL2, BASE2)):
+        for попытка in (1, 2):     # 2.2: не прошло — переписать один раз
+            txt, usage, why = _korotko_once(article, модель, база)
+            if usage:
+                usage_total = usage
+            if not txt:
+                if why:
+                    break          # площадка не ответила — к запасной
+                continue
+            low = txt.lower()
+            if any(b in low for b in SOVET):
+                log.append({"заголовок": title[:80],
+                            "коротко": "совет купить/продать"})
+                continue
+            if copied(txt, article):
+                log.append({"заголовок": title[:80],
+                            "коротко": "копирует оригинал (попытка %d)" % попытка})
+                continue
+            return txt, usage_total
+    return None, usage_total
+
+
+# =====================================================================
 # ПАЧКОЙ ДО ДЕСЯТИ ЗАГОЛОВКОВ В ОДНОМ ЗАПРОСЕ (пункт 1.3 задания)
 # =====================================================================
 # ЗАЧЕМ. Раньше каждый заголовок стоил отдельного запроса, и в каждом

@@ -151,6 +151,11 @@ BUDGET_HARD_CAP_RUB = 5.0
 BUDGET_RUB_DAY = min(_env_float("VOLOK_AI_BUDGET_DAY", 5.0), BUDGET_HARD_CAP_RUB)
 if BUDGET_RUB_DAY <= 0:
     BUDGET_RUB_DAY = BUDGET_HARD_CAP_RUB
+
+# Сколько «коротко» писать за один прогон. Растягиваем на несколько суток
+# (часть 2.5): маленькими порциями, чтобы не выесть предел зараз и чтобы
+# первые прогоны можно было проверить глазами. _env_int определён выше.
+KOROTKO_MAX_PER_RUN = _env_int("VOLOK_KOROTKO_PER_RUN", 6)
 BUDGET_KEEP_DAYS = 14
 
 
@@ -418,6 +423,38 @@ def main():
     if len(new_items) > AI_MAX_PER_RUN:
         print("разбор отложен для %d новостей (предохранитель)"
               % (len(new_items) - AI_MAX_PER_RUN))
+
+    # ---------------- «КОРОТКО»: свой пересказ статьи (задание /novosti/)
+    #
+    # Приоритет mine+ru (часть 2.5): если на всё не хватит предела, важные
+    # для нас темы получают пересказ первыми. Идём только по тем, у кого
+    # «коротко» ещё нет, и в том же суточном пределе, что и оценки.
+    kor = {"сделано": 0, "снято": 0}
+    if getattr(ai_mod, "KOROTKO_ON", False) and ai_mod.KEY:
+        приоритет = lambda r: 0 if (set(r.get("метки") or []) & {"mine", "ru"}) else 1
+        кандидаты = [r for r in sorted(merged.values(),
+                                       key=lambda x: (приоритет(x), -int(x.get("unix") or 0)))
+                     if not r.get("коротко") and r.get("ссылка")]
+        for r in кандидаты[:KOROTKO_MAX_PER_RUN]:
+            уже = истрачено_днём + (used["руб"] or 0.0)
+            if BUDGET_RUB_DAY > 0 and уже >= BUDGET_RUB_DAY:
+                ailog.append({"причина": "предел суток достигнут — «коротко» "
+                                         "отложено до следующих суток"})
+                break
+            txt, usage = ai_mod.korotko(r["заголовок"], r["ссылка"], ailog)
+            used["вход"] += int(usage.get("prompt_tokens")
+                                or usage.get("input_tokens") or 0)
+            used["выход"] += int(usage.get("completion_tokens")
+                                 or usage.get("output_tokens") or 0)
+            used["запросов"] += 1
+            _r = price_rub(used["вход"], used["выход"])
+            used["руб"] = round(_r, 4) if _r is not None else used["руб"]
+            if txt:
+                r["коротко"] = txt
+                kor["сделано"] += 1
+            else:
+                kor["снято"] += 1
+        print("«коротко»: написано %d, снято %d" % (kor["сделано"], kor["снято"]))
 
     # ---------------- market
     try:
