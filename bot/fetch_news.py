@@ -144,7 +144,13 @@ def _env_float(name, default):
         return default
 
 
-BUDGET_RUB_DAY = _env_float("VOLOK_AI_BUDGET_DAY", 5.0)
+# Р2 задания v50 (решение владельца 29.09.2026): 5 ₽/сутки — ЖЁСТКИЙ
+# потолок бота. Переменная Actions может предел только снизить; поднять
+# выше 5 нельзя ничем, кроме правки этого файла.
+BUDGET_HARD_CAP_RUB = 5.0
+BUDGET_RUB_DAY = min(_env_float("VOLOK_AI_BUDGET_DAY", 5.0), BUDGET_HARD_CAP_RUB)
+if BUDGET_RUB_DAY <= 0:
+    BUDGET_RUB_DAY = BUDGET_HARD_CAP_RUB
 BUDGET_KEEP_DAYS = 14
 
 
