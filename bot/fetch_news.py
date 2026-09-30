@@ -326,6 +326,29 @@ def main():
         new_items.append(rec)
     print("новых новостей: %d" % len(new_items))
 
+    # ---------------- 1.10/1.11: перепроверка УЖЕ записанных «коротко» и
+    # разборов новыми правилами. Не прошло — снимаем в самой ленте (у
+    # разбора остаётся оценка impact, снимается только текст). Так отказы,
+    # попавшие в ленту прошлыми прогонами, уходят при первом же прогоне.
+    чищ_к = чищ_р = 0
+    for r in merged.values():
+        k = r.get("коротко")
+        if k:
+            good, _ = ai_mod.checks.korotko_ok(k, r["заголовок"], r.get("unix"))
+            if not good:
+                r.pop("коротко", None)
+                чищ_к += 1
+        a = r.get("ai") or {}
+        t = a.get("text") if isinstance(a, dict) else None
+        if t:
+            good, _ = ai_mod.checks.razbor_ok(t, r["заголовок"], r.get("unix"))
+            if not good:
+                a["text"] = ""
+                чищ_р += 1
+    if чищ_к or чищ_р:
+        print("перепроверка старого: снято коротко %d, текстов разбора %d"
+              % (чищ_к, чищ_р))
+
     # ---------------- разбор ИИ только для новых, ПАЧКАМИ ПО ДЕСЯТЬ
     #
     # ПОЧЕМУ ПАЧКАМИ (пункт 1.3 задания «стоп тратам»). Инструкция модели
@@ -441,7 +464,8 @@ def main():
                 ailog.append({"причина": "предел суток достигнут — «коротко» "
                                          "отложено до следующих суток"})
                 break
-            txt, usage = ai_mod.korotko(r["заголовок"], r["ссылка"], ailog)
+            txt, usage = ai_mod.korotko(r["заголовок"], r["ссылка"], ailog,
+                                        pub_unix=r.get("unix"))
             used["вход"] += int(usage.get("prompt_tokens")
                                 or usage.get("input_tokens") or 0)
             used["выход"] += int(usage.get("completion_tokens")

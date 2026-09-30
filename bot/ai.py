@@ -58,6 +58,8 @@ import time
 import urllib.error
 import urllib.request
 
+import checks   # проверки «Коротко»/разбора (задание 30.09, этап 1)
+
 # --------------------------------------------------------------- настройки
 # Пустая переменная GitHub Actions приходит ПУСТОЙ СТРОКОЙ, а не
 # отсутствует, — поэтому везде «or ''» и strip().
@@ -328,10 +330,15 @@ SYSTEM_KOROTKO = (
     "Ты пишешь короткий пересказ новости для владельца майнинг-фермы. "
     "Тебе дают текст статьи. Перескажи суть 2–3 предложениями СВОИМИ "
     "словами, простым русским. Строгие правила: не копируй фразы из "
-    "оригинала (перефразируй), не советуй покупать или продавать, не "
-    "предсказывай цену числами, не выдумывай фактов и статей законов, не "
-    "добавляй ничего от себя сверх статьи. Только пересказ, без вступлений "
-    "и заголовков."
+    "оригинала (перефразируй); не советуй покупать или продавать; не "
+    "предсказывай цену числами; не выдумывай фактов и статей законов; не "
+    "добавляй ничего от себя сверх статьи. "
+    "НЕ МЕНЯЙ ВРЕМЯ СОБЫТИЙ: то, что запланировано на будущее, пиши в "
+    "будущем времени (запустят, выйдет, вступит в силу), а не в прошедшем. "
+    "НЕ ОБРАЩАЙСЯ К ЧИТАТЕЛЮ и не пиши о себе: никаких «извините», "
+    "«пришлите текст», «как ИИ», «я не могу». Если текста мало или он "
+    "нечитаем — ответь одним словом: НЕТ. "
+    "Только пересказ, без вступлений, заголовков и вопросов."
 )
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -346,10 +353,32 @@ def fetch_article(url, timeout=None):
     Точный парсинг не нужен — модель пересказывает суть, а не структуру."""
     timeout = timeout or TIMEOUT
     try:
+        # Просим несжатое, но некоторые сайты (Bits.media) ВСЁ РАВНО отдают
+        # gzip — 30.09 из-за этого текст приходил сжатыми байтами, модель
+        # видела мусор и отвечала отказом. Поэтому распаковываем сами по
+        # заголовку И по magic-байтам.
         req = urllib.request.Request(url, headers={
-            "user-agent": "Mozilla/5.0 (compatible; VolokNewsBot/1.0)"})
+            "user-agent": "Mozilla/5.0 (compatible; VolokNewsBot/1.0)",
+            "accept-encoding": "identity"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read(600000).decode("utf-8", "replace")
+            data = r.read(1200000)
+            enc = (r.headers.get("Content-Encoding") or "").lower()
+        if enc == "gzip" or data[:2] == b"\x1f\x8b":
+            import gzip as _gz
+            data = _gz.decompress(data)
+        elif enc == "deflate":
+            import zlib as _zl
+            try:
+                data = _zl.decompress(data)
+            except Exception:
+                data = _zl.decompress(data, -_zl.MAX_WBITS)
+        elif enc == "br":
+            try:
+                import brotli as _br
+                data = _br.decompress(data)
+            except Exception:
+                return ""   # brotli не собран — пересказа не будет (С1)
+        raw = data.decode("utf-8", "replace")
     except Exception:                                           # noqa: BLE001
         return ""
     # вырезаем <article> если есть — там основной текст; иначе весь body
@@ -406,16 +435,20 @@ def _korotko_once(article, модель, база):
     return txt, (d.get("usage") or {}), None
 
 
-def korotko(title, url, log):
+def korotko(title, url, log, pub_unix=None):
     """«Коротко» своими словами. Возвращает (текст|None, usage).
 
-    Нет ключа / выключено / статья не открылась / не прошло проверку на
-    копирование дважды — None (С1: блок «Коротко» просто не покажется)."""
+    Защита ВХОДА (1.6): текст статьи проверяется checks.article_ok ДО
+    вызова модели — на мусор денег не тратим. Защита ВЫХОДА (1.7/1.8):
+    checks.korotko_ok — отказы, обращения, «как ИИ», длина, слово
+    заголовка, будущая дата в прошедшем. Плюс проверка на копирование.
+    Не прошло — переписать один раз; снова — «Коротко» нет (С1)."""
     if not KOROTKO_ON or not KEY:
         return None, {}
     article = fetch_article(url)
-    if len(_words(article)) < 40:
-        log.append({"заголовок": title[:80], "коротко": "статья не открылась"})
+    ok, why = checks.article_ok(article, title)
+    if not ok:
+        log.append({"заголовок": title[:80], "коротко": "статья не годится: " + why})
         return None, {}
     usage_total = {}
     for роль, модель, база in (("основная", MODEL, BASE),
@@ -428,12 +461,12 @@ def korotko(title, url, log):
                 if why:
                     break          # площадка не ответила — к запасной
                 continue
-            low = txt.lower()
-            if any(b in low for b in SOVET):
+            good, prichina = checks.korotko_ok(txt, title, pub_unix)
+            if not good:
                 log.append({"заголовок": title[:80],
-                            "коротко": "совет купить/продать"})
+                            "коротко": "%s (попытка %d)" % (prichina, попытка)})
                 continue
-            if copied(txt, article):
+            if checks.copied(txt, article):
                 log.append({"заголовок": title[:80],
                             "коротко": "копирует оригинал (попытка %d)" % попытка})
                 continue
