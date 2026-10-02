@@ -25,9 +25,11 @@ ai.py — разбор заголовка: как новость влияет н
 ЧТО НА ВХОД И ЧТО НА ВЫХОД
   На вход — ТОЛЬКО заголовок, источник и дата. Текст статьи и картинки
   бот не берёт и не хранит (решение владельца).
-  На выход — строго JSON:
-      {"impact": "plus" | "minus" | "risk" | "neutral",
-       "text": "одна фраза до 140 знаков"}
+  На выход — строго JSON с ОДНИМ полем:
+      {"impact": "plus" | "minus" | "risk" | "neutral"}
+  Фразы разбора больше нет: с 02.10.2026 мнение под новостью пишет
+  редакция, одно на весь день, а модель ставит только метку. Ею красится
+  заголовок и считаются бычьи/медвежьи/нейтральные в полосе дня.
 
 ЧЕТЫРЕ ЗАПРЕТА, И ОНИ ВАЖНЕЕ КРАСИВОГО ОТВЕТА
   1. НЕ ВЫДУМЫВАТЬ СВЕРХ ЗАГОЛОВКА. Модель видит только заголовок —
@@ -99,14 +101,13 @@ SYSTEM = (
     "России.\n"
     "Отвечай СТРОГО одним JSON-объектом, без пояснений, без рассуждений и "
     "без разметки:\n"
-    '{"impact":"plus|minus|risk|neutral","text":"одна фраза до 140 знаков"}\n'
+    '{"impact":"plus|minus|risk|neutral"}\n'
     "impact: plus — доход фермы скорее вырастет; minus — скорее упадёт; "
     "risk — прямого влияния нет, но есть угроза (проверки, запреты, "
     "возможная коррекция курса); neutral — на доход фермы не влияет.\n"
     "Запреты: не придумывай содержание статьи сверх заголовка; "
     "если по заголовку непонятно — neutral; "
-    "никаких советов покупать или продавать; "
-    "text не длиннее 140 знаков."
+    "никаких пояснений и никакого текста — ТОЛЬКО поле impact."
 )
 
 # Слова-советы: их наличие в ответе — отказ. Запрет N3.
@@ -192,7 +193,10 @@ def ask_raw(title, source, date_ru, model=None, base=None, key=None,
     timeout = timeout or TIMEOUT
     тело = _телом_без_рассуждений({
         "model": model,
-        "max_tokens": 300,
+        #  Ответ теперь — один короткий JSON с полем impact.
+        #  Триста токенов под него держать незачем: платим за
+        #  выход, а рассуждения модели считаются выходом.
+        "max_tokens": 64,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": SYSTEM},
@@ -240,19 +244,20 @@ def parse(raw):
         return None, "JSON не разобрался"
 
     imp = str(j.get("impact", "")).strip().lower()
-    txt = str(j.get("text", "")).strip()
     if imp not in IMPACTS:
         return None, "неизвестный impact %r" % imp[:20]
-    if not txt:
-        return None, "пустой text"
-    if len(txt) > MAXLEN:
-        # Обрезать — значит подделать ответ. Отказываемся.
-        return None, "text длиннее %d знаков (%d)" % (MAXLEN, len(txt))
-    low = txt.lower()
-    for bad in SOVET:
-        if bad in low:
-            return None, "совет покупать или продавать"
-    return {"impact": imp, "text": txt}, None
+    #  ТОЛЬКО МЕТКА (решение владельца 02.10.2026). Фразу разбора мы
+    #  больше не просим и не храним: мнение под новостью пишет редакция.
+    #  Если модель по привычке всё же прислала text, он проверяется на
+    #  советы и выбрасывается — в ленту не попадает ни при каких
+    #  условиях, и значит не может туда просочиться позже.
+    txt = str(j.get("text", "")).strip()
+    if txt:
+        low = txt.lower()
+        for bad in SOVET:
+            if bad in low:
+                return None, "совет покупать или продавать"
+    return {"impact": imp}, None
 
 
 def analyse(title, source, date_ru, log):
@@ -500,8 +505,7 @@ SYSTEM_BATCH = (
     "для майнеров в России.\n"
     "Отвечай СТРОГО одним JSON-объектом, без пояснений, без рассуждений "
     "и без разметки:\n"
-    "{\"items\":[{\"n\":1,\"impact\":\"plus|minus|risk|neutral\","
-    "\"text\":\"одна фраза до 140 знаков\"}]}\n"
+    "{\"items\":[{\"n\":1,\"impact\":\"plus|minus|risk|neutral\"}]}\n"
     "В items — по одной записи на КАЖДЫЙ номер из списка, номер n тот же, "
     "что во входе.\n"
     "impact: plus — доход фермы скорее вырастет; minus — скорее упадёт; "
@@ -509,8 +513,7 @@ SYSTEM_BATCH = (
     "возможная коррекция курса); neutral — на доход фермы не влияет.\n"
     "Запреты: не придумывай содержание статьи сверх заголовка; "
     "если по заголовку непонятно — neutral; "
-    "никаких советов покупать или продавать; "
-    "text не длиннее 140 знаков."
+    "никаких пояснений и никакого текста — ТОЛЬКО поля n и impact."
 )
 
 
@@ -525,7 +528,9 @@ def ask_raw_batch(записи, model=None, base=None, key=None, timeout=None,
     base = (base or BASE).rstrip("/")
     key = key or KEY
     timeout = timeout or TIMEOUT
-    each = int(maxtok_each or _env("VOLOK_AI_MAXTOK_NEWS", "80"))
+    #  Было 80 на заголовок под фразу разбора; теперь в ответе
+    #  только номер и метка — хватает с запасом.
+    each = int(maxtok_each or _env("VOLOK_AI_MAXTOK_NEWS", "16"))
     список = "\n".join(
         "%d. Источник: %s | Дата: %s | Заголовок: %s" % (n, s, d, t)
         for n, t, s, d in записи)
@@ -603,8 +608,7 @@ def parse_batch(raw, номера):
             причины.append("номер %d пришёл дважды" % n)
             continue
         видел.add(n)
-        ai, why = parse(json.dumps({"impact": it.get("impact"),
-                                    "text": it.get("text")},
+        ai, why = parse(json.dumps({"impact": it.get("impact")},
                                    ensure_ascii=False))
         if ai is None:
             причины.append("номер %d: %s" % (n, why))
